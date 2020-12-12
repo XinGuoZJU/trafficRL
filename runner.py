@@ -1,0 +1,409 @@
+"""
+
+"""
+from __future__ import absolute_import
+from __future__ import print_function
+
+import os
+import sys
+import optparse
+import subprocess
+import random
+from collections import Counter
+from pymongo import MongoClient
+from dbFunction import dbFunction, initTrafficLight, initRunCount, saveStats, getRunCount
+from globals import init
+from helper import updateVehDistribution, plotGraph, savePlot, generate_routefile, getDBName
+from visTools import visTools
+
+
+# we need to import python modules from the $SUMO_HOME/tools directory
+try:
+    sys.path.append(os.path.join(os.path.dirname(
+        __file__), '..', '..', '..', '..', "tools"))  # tutorial in tests
+    sys.path.append(os.path.join(os.environ.get("SUMO_HOME", os.path.join(
+        os.path.dirname(__file__), "..", "..", "..")), "tools"))  # tutorial in docs
+    from sumolib import checkBinary
+except ImportError:
+    sys.exit(
+        "please declare environment variable 'SUMO_HOME' as the root directory of your sumo installation (it should contain folders 'bin', 'tools' and 'docs')")
+
+import traci
+import torch
+
+client = MongoClient()
+
+
+def defGetNetSpeed():
+    tmp_edge_speed = torch.zeros(1)
+    vehicle_list = traci.vehicle.getIDList()
+    CT = 0.
+    for i, vehicle in enumerate(vehicle_list):
+        if traci.vehicle.getSpeed(vehicle) >= 0.:
+            tmp_edge_speed += traci.vehicle.getSpeed(vehicle)
+            CT += 1.
+    tmp_edge_speed /= CT
+    if CT == 0.:
+        tmp_edge_speed[0] = 16.7
+    return tmp_edge_speed
+
+
+def getRoadState():
+    edges = traci.edge.getIDList()
+    state= 0.
+    for edge in edges:
+        state += traci.edge.getLastStepHaltingNumber(edge)
+    return state
+
+
+
+def defGetEdgeInfoToPrint():
+    EdgeIds = traci.edge.getIDList()
+    travelTime = 0.
+    WaitingTime = 0.
+    for ct, edge in enumerate(EdgeIds):
+        tmptravelTime = traci.edge.getTraveltime(edge)
+        travelTime += tmptravelTime
+        tmpWaitingTime = traci.edge.getWaitingTime(edge)
+        WaitingTime += tmpWaitingTime
+    travelTime /= ct
+    WaitingTime /= ct
+    return travelTime, WaitingTime
+
+
+def run(options):
+    initRunCount(options)
+    db = client[options.dbName]
+    tempStats = []
+    temp = []
+
+    # get list of traffic lights
+    trafficLights = traci.trafficlights.getIDList()
+    trafficLightsNumber = traci.trafficlights.getIDCount()
+
+    # we set every light to phase 0
+    for ID in trafficLights:
+        traci.trafficlights.setPhase(ID, 0)
+        initTrafficLight(ID)
+        tempStats.append(temp)
+
+    phaseVector = 6*[None]
+    prePhase = trafficLightsNumber*[phaseVector]
+    preAction = trafficLightsNumber*[0]
+    currPhase = trafficLightsNumber*[0]
+    currTime = 0
+    dbStep = 10
+    avgQL = trafficLightsNumber*[0]
+    avgQLCurr = trafficLightsNumber*[0]
+    oldVeh = trafficLightsNumber*[None]
+    cumuDelay = trafficLightsNumber*[None]
+    ages = trafficLightsNumber*[0]
+    avgPlot = 0
+
+    # get age value from DB
+    i = 0
+    for ID in trafficLights:
+        qValues = db['qValues' + ID]
+        if (qValues.find({"ageExists": True}).count() != 0):
+            ages[i] = qValues.find_one({"ageExists": True})['age']
+        i+=1
+
+    # execute the TraCI control loop
+    step = 1
+    speedToLog=0.
+    haltingToLog=0.
+    GlobalSpeed=0.
+    GlobalHalting=0.
+    GlobalWaiting=0.
+    edge_set = [0, 1, 2, 3, 7, 8, 12, 13, 17, 18, 19, 20]
+    intersection = {'A1': 0, 'A2': 1, 'A3': 2, 'B0': 3, 'B1': 4, 'B2': 5, 'B3': 6, 'B4': 7, 'C0': 8, 'C1': 9, 'C2': 10,
+                    'C3': 11, 'C4': 12, 'D0': 13, 'D1': 14, 'D2': 15, 'D3': 16, 'D4': 17, 'E1': 18, 'E2': 19, 'E3': 20}
+
+    while traci.simulation.getMinExpectedNumber() > 0:
+        tmpspeed=defGetNetSpeed()
+        tmphalting=getRoadState()
+        _, tmpWaiting = defGetEdgeInfoToPrint()
+        GlobalSpeed+=tmpspeed
+        GlobalHalting+=tmphalting
+        GlobalWaiting += tmpWaiting
+        if step % 120 ==0:
+            speedToLog += tmpspeed
+            haltingToLog += tmphalting
+            visTool.global_speed_logger.logSpeed(step/120, speedToLog/120.)
+            visTool.global_PassNum_Logger.log(step/120, haltingToLog/120.)
+            visTool.global_traveltime_logger.logwaitTime(step/120,tmpWaiting)
+            speedToLog=0.
+            haltingToLog=0.
+        else:
+            speedToLog += tmpspeed
+            haltingToLog += tmphalting
+
+        traci.simulationStep()
+
+        # current traffic light index number
+        i = 0
+        for ID in trafficLights:
+            # get lanes for each traffic light
+            lanes = traci.trafficlights.getControlledLanes(ID)
+            lanesUniq = []
+            # get unique lanes
+            j = 0
+            while j < len(lanes):
+                lanesUniq.append(lanes[j])
+                j+=2
+                lanesUniq.append(lanes[j])
+                j+=3
+            lanes = lanesUniq
+
+            # get average queue length for current time step
+            queueLength=[]
+            avgQLCurr[i] = 0
+            for lane in lanes:
+                queueLength.append(traci.lane.getLastStepHaltingNumber(lane))
+                avgQLCurr[i] += traci.lane.getLastStepHaltingNumber(lane)
+            avgQLCurr[i] = avgQLCurr[i]/(len(lanes)*1.0)
+
+            # get average queue length till now
+            avgQL[i] = (avgQL[i]*step + avgQLCurr[i])/((step+1)*1.0)
+
+            # call plot graph with avg ql every 10*dbDtep
+            if(i == trafficLightsNumber-1 and step%(dbStep*30) == 0):
+                avgPlot /= dbStep*10
+                plotGraph(step/(dbStep*30), avgPlot)
+                avgPlot = 0
+            elif(i == trafficLightsNumber-1):
+                avgQLTotal = 0
+                for avgQLC in avgQLCurr:
+                    avgQLTotal += avgQLC
+                avgQLTotal = avgQLTotal/(trafficLightsNumber*1.0)
+                avgPlot += avgQLTotal
+
+            options.bracket = int(options.bracket)
+
+            # run only for every db_step and when phase is not yellow
+            # yellow compulsory
+            currPhase[i] = traci.trafficlights.getPhase(ID)
+            condition = True
+            if (options.phasing == '1'):
+                condition = currPhase[i]!=2 and currPhase[i]!=4 and currPhase[i]!=7 and currPhase[i]!=9
+
+            if (step%dbStep == 0 and condition):
+                #emergency vehicle
+                for x in range(len(lanes)):
+                    listVehicles = traci.lane.getLastStepVehicleIDs(lanes[x])
+                    for veh in listVehicles:
+                        if( traci.vehicle.getTypeID(veh) == "v1" ):
+                            queueLength[x] += 5
+
+                # print and save current stats
+                # print(avgQL[i], avgQLCurr[i], step, ID, "AvgQLs, step, ID")
+                tempStats[intersection[ID]].append({"step": step,
+                                            "curr_qL": avgQLCurr[i],
+                                            "avgQL": avgQL[i],
+                                            "ID": ID})
+
+                # skip everything and run according to default values
+                if (options.learn == '0'):
+                    i+=1
+                    continue
+                if (options.stateRep == '1'):
+                    if len(queueLength) ==6:
+                        phaseVector[0] = int(round(max(queueLength[4], queueLength[5]) / options.bracket))
+                        phaseVector[1] = int(round(max(queueLength[0], queueLength[4]) / options.bracket))
+                        phaseVector[2] = int(round(max(queueLength[0], queueLength[1]) / options.bracket))
+                        phaseVector[3] = int(round(max(queueLength[3], queueLength[2]) / options.bracket))
+                    else:
+                        # generate current step's phase vector - with queueLength
+                        phaseVector[0] = int(round(max(queueLength[4], queueLength[5]) / options.bracket))
+                        phaseVector[1] = int(round(max(queueLength[0], queueLength[4]) / options.bracket))
+                        phaseVector[2] = int(round(max(queueLength[0], queueLength[1]) / options.bracket))
+                        phaseVector[3] = int(round(max(queueLength[3], queueLength[2]) / options.bracket))
+                        phaseVector[4] = int(round(max(queueLength[2], queueLength[6]) / options.bracket))
+                        phaseVector[5] = int(round(max(queueLength[6], queueLength[7]) / options.bracket))
+                elif (options.stateRep == '2'):
+                    # get cumulative delay
+                    cumulativeDelay = cumuDelay[i]
+                    oldVehicles = oldVeh[i]
+                    vehicles = []
+                    for z in lanes:
+                        vehicles.append(Counter())
+                    if(cumulativeDelay == None):
+                        cumulativeDelay = len(lanes)*[0]
+                    if(oldVehicles == None):
+                        oldVehicles = []
+                        for z in lanes:
+                            oldVehicles.append(Counter())
+                    j = 0
+                    for lane in lanes:
+                        listVehicles = traci.lane.getLastStepVehicleIDs(lane)
+                        for veh in listVehicles:
+                            vehicles[j][veh] = oldVehicles[j][veh]
+                            if (traci.vehicle.isStopped(veh)):
+                                vehicles[j][veh] += 1
+                                cumulativeDelay[j] += 1
+                        vehToDelete = oldVehicles[j] - vehicles[j]
+                        for veh, vDelay in vehToDelete.most_common():
+                            cumulativeDelay[j] -= vDelay
+                        oldVehicles[j] = vehicles[j]
+                        j+=1
+                    cumuDelay[i] = cumulativeDelay
+                    oldVeh[i] = oldVehicles
+
+                    # generate current step's phase vector - with cumulativeDelay
+                    phaseVector[0] = int(round(cumulativeDelay[4] + cumulativeDelay[5])/options.bracket)
+                    phaseVector[1] = int(round(cumulativeDelay[0] + cumulativeDelay[4])/options.bracket)
+                    phaseVector[2] = int(round(cumulativeDelay[0] + cumulativeDelay[1])/options.bracket)
+                    phaseVector[3] = int(round(cumulativeDelay[3] + cumulativeDelay[2])/options.bracket)
+                    phaseVector[4] = int(round(cumulativeDelay[2] + cumulativeDelay[6])/options.bracket)
+                    phaseVector[5] = int(round(cumulativeDelay[6] + cumulativeDelay[7])/options.bracket)
+
+                # update values
+                nextAction = dbFunction(phaseVector, prePhase[i], preAction[i], ages[i], currPhase[i], ID, options)
+                ages[i] += 0.01
+                prePhase[i] = phaseVector[:]
+
+                if(options.phasing=='1'):
+                    if intersection[ID] in edge_set and nextAction>=3:
+                        nextAction = 0
+                    else:
+                        traci.trafficlights.setPhase(ID, nextAction)
+                        if (nextAction != currPhase[i]):
+                            nextAction = 1
+                        else:
+                            nextAction = 0
+                else:
+                    if(nextAction != currPhase[i]):
+                        oldRGYState = traci.trafficlights.getRedYellowGreenState(ID)
+                        traci.trafficlights.setPhase(ID, nextAction)
+                        newRGYState = traci.trafficlights.getRedYellowGreenState(ID)
+                        # print(oldRGYState, newRGYState, "old new")
+
+                        midRGYState = ""
+                        for k, c in enumerate(oldRGYState):
+                            if (c == 'G' and newRGYState[k] == 'r'):
+                                midRGYState += 'Y'
+                            elif(c == 'G' and newRGYState[k] == 'g'):
+                                midRGYState += 'g'
+                            else:
+                                midRGYState += c
+                        # print(midRGYState, "mid")
+
+                        traci.trafficlights.setRedYellowGreenState(ID, midRGYState)
+                        tempCounter = 5
+                        while(tempCounter > 0):
+                            traci.simulationStep()
+                            tempCounter -=1
+                        traci.trafficlights.setProgram(ID, 'custom2')
+                        traci.trafficlights.setPhase(ID, nextAction)
+                    else:
+                        traci.trafficlights.setPhase(ID, nextAction)
+
+                preAction[i] = nextAction
+
+            # increment traffic light index
+            i+=1
+        step += 1
+    print('GlobalSpeed',GlobalSpeed,'GlobalHalting',GlobalHalting)
+
+    # update age in DB
+    i = 0
+    for ID in trafficLights:
+        qValues = db['qValues' + ID]
+        qValues.find_one_and_update({"ageExists": True}, {"$set": {"age": ages[i]}}, upsert=True)
+        i+=1
+
+    # print final average
+    avgQLTotal = 0
+    i = 0
+    for avgQLC in avgQL:
+        # print(avgQLC, "Final", i)
+        i += 1
+        avgQLTotal += avgQLC
+    avgQLTotal = avgQLTotal/(trafficLightsNumber*1.0)
+    # print(avgQLTotal, "Final Total")
+
+    saveStats(trafficLightsNumber, tempStats)
+    savePlot(options.dbName + str(getRunCount()))
+
+    traci.close()
+    sys.stdout.flush()
+
+    return avgQLTotal
+
+# this gets the input parameters specified to the program
+def get_options():
+    optParser = optparse.OptionParser()
+    optParser.add_option("--nogui", action="store_true",
+                         default=False, help="run the commandline version of sumo")
+    optParser.add_option("--cars", "-C", dest="numberCars", default=1000, metavar="NUM",
+                         help="specify the number of cars generated for simulation")
+    optParser.add_option('--visdom_env', default='QLearning-TCP-3')
+    optParser.add_option("--projectname", default='QLearning-TCP-3')
+    optParser.add_option("--bracket", dest="bracket", default=4, metavar="BRACKET",
+                         help="specify the number with which to partition the range of queue length/cumulative delay")
+    optParser.add_option("--learning", dest="learn", default='1', metavar="NUM", choices= ['0', '1', '2'],
+                         help="specify learning method (0 = No Learning, 1 = Q-Learning, 2 = SARSA)")
+    optParser.add_option("--state", dest="stateRep", default='1', metavar="NUM", choices= ['1', '2'],
+                         help="specify traffic state representation to be used (1 = Queue Length, 2 = Cumulative Delay)")
+    optParser.add_option("--phasing", dest="phasing", default='1', metavar="NUM", choices= ['1', '2'],
+                         help="specify phasing scheme (1 = Fixed Phasing, 2 = Variable Phasing)")
+    optParser.add_option("--action", dest="actionSel", default='1', metavar="NUM", choices= ['1', '2'],
+                         help="specify action selection method (1 = epsilon greedy, 2 = softmax)")
+    optParser.add_option("--sublane", dest="sublaneNumber", default=2, metavar="FLOAT",
+                         help="specify number of sublanes per edge (max=6) ")
+    optParser.add_option("--dbstep", dest="sbStep", default=10, metavar="NUM",
+                         help="specify dbStep, default is 10 ")
+    optParser.add_option("--dbName", dest="dbName", default='tl', metavar="STRING",
+                         help="specify dbName prefix")
+
+    options, args = optParser.parse_args()
+    return options
+
+
+
+# this is the main entry point of this script
+if __name__ == "__main__":
+
+    options = get_options()
+    MAP = 'TCP-accident'
+
+    visTool = visTools(options)
+    # this script has been called from the command line. It will start sumo as a
+    # server, then connect and run
+    if options.nogui:
+        sumoBinary = checkBinary('sumo')
+    else:
+        sumoBinary = checkBinary('sumo-gui')
+
+    # generate the route file for this simulation
+    generate_routefile(options)
+
+    options.dbName = getDBName(options)
+
+    addFile = '{}/cross.add.xml'.format(MAP)
+
+
+    edgeWidth=5
+    lateral_resolution_width=2.5
+    if(int(options.sublaneNumber) <= 6.0):
+        lateral_resolution_width=float(edgeWidth/int(options.sublaneNumber))
+
+    lateral_resolution_width=str(lateral_resolution_width)
+
+    # Sumo is started as a subprocess and then the python script connects and runs
+    if MAP =='TCP-1':
+        rouFile="{}/traffic_flow/{}/cross.trip.1.xml".format(MAP, 'train_contr')+','+"{}/traffic_flow/{}/cross.trip.2.xml".format(MAP, 'train_contr')+','+"{}/traffic_flow/{}/cross.trip.3.xml".format(MAP, 'train_contr')
+    elif MAP =='TCP-2' or MAP =='TCP-3':
+        rouFile = "{}/traffic_flow/{}/cross.trip.1.xml".format(MAP, 'train_contr')+','+"{}/traffic_flow/{}/cross.trip.2.xml".format(MAP, 'train_contr')
+    elif MAP == 'TCP-accident':
+        rouFile = "{}/traffic_flow/{}/cross.trip.4.xml".format(MAP, 'train_contr')
+    traci.start([sumoBinary, "-c", "{}/cross.sumocfg".format(MAP),
+                             "-n", "{}/cross.net.xml".format(MAP),
+                             "-a", addFile,
+                             "-r", rouFile,
+                             "--lateral-resolution",
+                 lateral_resolution_width,
+                 "--start"],
+                )
+    init(options)
+    run(options)
